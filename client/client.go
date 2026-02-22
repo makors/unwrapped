@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"time"
 
@@ -18,7 +20,7 @@ import (
 
 var (
 	serverAddr = flag.String("server", "ws.makors.xyz", "websocket server address")
-	useTLS     = flag.Bool("tls", false, "use wss:// instead of ws://")
+	useTLS     = flag.Bool("tls", true, "use wss:// instead of ws://")
 )
 
 const httpSMSEndpoint = "https://api.httpsms.com/v1/messages/send"
@@ -38,9 +40,13 @@ type smsRequest struct {
 	To      string `json:"to"`
 }
 
-func sendSMS(apiKey, from, to string, message []byte) {
+type discordPayload struct {
+	Content string `json:"content"`
+}
+
+func sendSMS(apiKey, from, to string, message string) {
 	body, err := json.Marshal(smsRequest{
-		Content: string(message),
+		Content: message,
 		From:    from,
 		To:      to,
 	})
@@ -74,11 +80,48 @@ func sendSMS(apiKey, from, to string, message []byte) {
 	slog.Info("SMS sent via httpSMS", "to", to, "status", resp.StatusCode)
 }
 
+func sendIMessage(to string, message string) {
+	script := fmt.Sprintf(`tell application "Messages"
+	set targetService to 1st account whose service type = SMS
+	set targetBuddy to participant %q of targetService
+	send %q to targetBuddy
+end tell`, to, message)
+
+	cmd := exec.Command("osascript", "-e", script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		slog.Error("failed to send iMessage", "error", err.Error(), "output", string(out))
+		return
+	}
+	slog.Info("iMessage sent", "to", to)
+}
+
+func sendDiscordWebhook(webhookURL string, code string) {
+	content := fmt.Sprintf("# [CLICK HERE FOR FREE CHIPOTLE](sms://888222?body=%s)", code)
+	body, err := json.Marshal(discordPayload{Content: content})
+	if err != nil {
+		slog.Error("failed to marshal discord payload", "error", err.Error())
+		return
+	}
+
+	resp, err := httpClient.Post(webhookURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		slog.Error("failed to send discord webhook", "error", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		slog.Error("discord webhook returned error", "status", resp.StatusCode)
+		return
+	}
+	slog.Info("discord webhook sent", "status", resp.StatusCode)
+}
+
 func main() {
 	flag.Parse()
 
-	err := godotenv.Load()
-	if err != nil {
+	if err := godotenv.Load(); err != nil {
 		slog.Error("error loading .env file")
 		os.Exit(1)
 	}
@@ -86,9 +129,24 @@ func main() {
 	httpSMSKey := os.Getenv("HTTPSMS_API_KEY")
 	httpSMSFrom := os.Getenv("HTTPSMS_FROM")
 	httpSMSTo := os.Getenv("HTTPSMS_TO")
-	if httpSMSKey == "" || httpSMSFrom == "" || httpSMSTo == "" {
-		slog.Error("HTTPSMS_API_KEY, HTTPSMS_FROM, and HTTPSMS_TO env vars are required")
+	smsEnabled := httpSMSKey != "" && httpSMSFrom != "" && httpSMSTo != ""
+
+	imessageTo := os.Getenv("IMESSAGE_TO")
+	discordWebhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
+
+	if !smsEnabled && imessageTo == "" && discordWebhookURL == "" {
+		slog.Error("no delivery methods configured; set HTTPSMS_*, IMESSAGE_TO, and/or DISCORD_WEBHOOK_URL")
 		os.Exit(1)
+	}
+
+	if smsEnabled {
+		slog.Info("httpSMS enabled", "from", httpSMSFrom, "to", httpSMSTo)
+	}
+	if imessageTo != "" {
+		slog.Info("iMessage enabled", "to", imessageTo)
+	}
+	if discordWebhookURL != "" {
+		slog.Info("Discord webhook enabled")
 	}
 
 	scheme := "ws"
@@ -111,12 +169,15 @@ func main() {
 
 	slog.Info("connected to server")
 
-	// server pings us every minute, we need to respond within 10s
-	// gorilla/websocket responds to pings automatically, but we set
-	// a read deadline so we notice if the server disappears
-	ws.SetReadDeadline(time.Now().Add(80 * time.Second))
+	const (
+		pingInterval = 30 * time.Second
+		pongWait     = 10 * time.Second
+	)
+	readDeadline := pingInterval + pongWait
+
+	ws.SetReadDeadline(time.Now().Add(readDeadline))
 	ws.SetPongHandler(func(string) error {
-		ws.SetReadDeadline(time.Now().Add(80 * time.Second))
+		ws.SetReadDeadline(time.Now().Add(readDeadline))
 		return nil
 	})
 
@@ -124,6 +185,29 @@ func main() {
 	signal.Notify(interrupt, os.Interrupt)
 
 	done := make(chan struct{})
+	closeCh := make(chan struct{}, 1)
+
+	go func() {
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-closeCh:
+				ws.WriteMessage(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+				)
+				return
+			case <-ticker.C:
+				if err := ws.WriteMessage(websocket.PingMessage, nil); err != nil {
+					slog.Error("ping error", "error", err.Error())
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
 
 	go func() {
 		defer close(done)
@@ -133,8 +217,19 @@ func main() {
 				slog.Error("read error, disconnected", "error", err.Error())
 				return
 			}
+
+			msg := string(message)
 			slog.Info("received message", "size", len(message))
-			go sendSMS(httpSMSKey, httpSMSFrom, httpSMSTo, message)
+
+			if smsEnabled {
+				go sendSMS(httpSMSKey, httpSMSFrom, httpSMSTo, msg)
+			}
+			if imessageTo != "" {
+				go sendIMessage(imessageTo, msg)
+			}
+			if discordWebhookURL != "" {
+				go sendDiscordWebhook(discordWebhookURL, msg)
+			}
 		}
 	}()
 
@@ -143,13 +238,7 @@ func main() {
 		slog.Info("connection closed")
 	case <-interrupt:
 		slog.Info("interrupted, closing connection...")
-		err := ws.WriteMessage(
-			websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-		)
-		if err != nil {
-			slog.Error("error sending close message", "error", err.Error())
-		}
+		closeCh <- struct{}{}
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
